@@ -1,0 +1,205 @@
+name: Full IaC Pipeline
+
+on:
+  push:
+    branches:
+      - dev
+      - staging
+      - main
+  workflow_dispatch:
+    inputs:
+      target_environment:
+        description: "Target environment"
+        type: choice
+        required: true
+        default: dev
+        options:
+          - dev
+          - staging
+          - prod
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      target_env: ${{ steps.resolve.outputs.target_env }}
+      image_tag: ${{ steps.resolve.outputs.image_tag }}
+      backend_image: ${{ steps.resolve.outputs.backend_image }}
+      frontend_image: ${{ steps.resolve.outputs.frontend_image }}
+    steps:
+      - id: resolve
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TARGET_ENV="${{ inputs.target_environment }}"
+          elif [ "${GITHUB_REF_NAME}" = "main" ]; then
+            TARGET_ENV="prod"
+          elif [ "${GITHUB_REF_NAME}" = "staging" ]; then
+            TARGET_ENV="staging"
+          else
+            TARGET_ENV="dev"
+          fi
+
+          IMAGE_TAG="${GITHUB_SHA}"
+          REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+
+          echo "target_env=${TARGET_ENV}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "backend_image=${{ env.REGISTRY }}/${REPO_LOWER}-backend:${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "frontend_image=${{ env.REGISTRY }}/${REPO_LOWER}-frontend:${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    runs-on: ubuntu-latest
+    outputs:
+      backend_image: ${{ needs.resolve.outputs.backend_image }}
+      frontend_image: ${{ needs.resolve.outputs.frontend_image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ${{ env.REGISTRY }} -u "${{ github.actor }}" --password-stdin
+
+      - name: Build backend image
+        run: |
+          docker build -t "${{ needs.resolve.outputs.backend_image }}" ./backend
+
+      - name: Build frontend image
+        run: |
+          docker build             --build-arg VITE_API_URL="${{ vars.PUBLIC_API_URL }}"             -t "${{ needs.resolve.outputs.frontend_image }}"             ./frontend
+
+      - name: Push images
+        run: |
+          docker push "${{ needs.resolve.outputs.backend_image }}"
+          docker push "${{ needs.resolve.outputs.frontend_image }}"
+
+  deploy:
+    needs:
+      - resolve
+      - build
+    runs-on: ubuntu-latest
+    environment: ${{ needs.resolve.outputs.target_env }}
+
+    steps:
+      - name: Generate runtime files
+        run: |
+          mkdir runtime
+
+          cat > runtime/.env <<EOF
+          APP_NAME=${{ vars.APP_NAME }}
+          ENVIRONMENT=${{ needs.resolve.outputs.target_env }}
+
+          BACKEND_PORT=${{ vars.BACKEND_PORT }}
+          FRONTEND_PORT=${{ vars.FRONTEND_PORT }}
+
+          MYSQL_ROOT_PASSWORD=${{ secrets.MYSQL_ROOT_PASSWORD }}
+          MYSQL_DATABASE=${{ vars.MYSQL_DATABASE }}
+          MYSQL_USER=${{ secrets.MYSQL_USER }}
+          MYSQL_PASSWORD=${{ secrets.MYSQL_PASSWORD }}
+
+          REDIS_PORT=${{ vars.REDIS_PORT }}
+
+          BACKEND_IMAGE=${{ needs.build.outputs.backend_image }}
+          FRONTEND_IMAGE=${{ needs.build.outputs.frontend_image }}
+          EOF
+
+          cat > runtime/docker-compose.yml <<'EOF'
+          services:
+            mysql:
+              image: mysql:8.4
+              container_name: ${APP_NAME}-mysql
+              restart: unless-stopped
+              environment:
+                MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+                MYSQL_DATABASE: ${MYSQL_DATABASE}
+                MYSQL_USER: ${MYSQL_USER}
+                MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+              volumes:
+                - mysql_data:/var/lib/mysql
+              healthcheck:
+                test: ["CMD-SHELL", "mysqladmin ping -h localhost -u$${MYSQL_USER} -p$${MYSQL_PASSWORD}"]
+                interval: 10s
+                timeout: 5s
+                retries: 10
+
+            redis:
+              image: redis:7-alpine
+              container_name: ${APP_NAME}-redis
+              restart: unless-stopped
+              volumes:
+                - redis_data:/data
+
+            backend:
+              image: ${BACKEND_IMAGE}
+              container_name: ${APP_NAME}-backend
+              restart: unless-stopped
+              ports:
+                - "${BACKEND_PORT}:3000"
+              environment:
+                PORT: 3000
+                DB_HOST: mysql
+                DB_PORT: 3306
+                DB_USER: ${MYSQL_USER}
+                DB_PASSWORD: ${MYSQL_PASSWORD}
+                DB_NAME: ${MYSQL_DATABASE}
+                REDIS_HOST: redis
+                REDIS_PORT: 6379
+              depends_on:
+                mysql:
+                  condition: service_healthy
+                redis:
+                  condition: service_started
+
+            frontend:
+              image: ${FRONTEND_IMAGE}
+              container_name: ${APP_NAME}-frontend
+              restart: unless-stopped
+              ports:
+                - "${FRONTEND_PORT}:80"
+              depends_on:
+                - backend
+
+          volumes:
+            mysql_data:
+            redis_data:
+          EOF
+
+      - name: Create deploy directory
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            mkdir -p "${{ vars.DEPLOY_PATH }}"
+
+      - name: Upload runtime files
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          source: "runtime/*"
+          target: "${{ vars.DEPLOY_PATH }}"
+          strip_components: 1
+
+      - name: Deploy on VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            cd "${{ vars.DEPLOY_PATH }}"
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+            docker compose pull
+            docker compose up -d
+            docker image prune -f
+            docker compose ps
